@@ -1,43 +1,34 @@
+use crate::client;
 use crate::config;
-use anyhow::{Context, Result};
-use cloudreve_sdk_api::{Client, ClientConfig};
-use cloudreve_sdk_api::api::user::UserApi;
-use cloudreve_sdk_uploader::{ProgressCallback, ProgressUpdate, Uploader, UploaderConfig, UploadParams};
-use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
+use anyhow::{bail, Context, Result};
+use cloudreve_sdk_uploader::{
+    Tracker, UploadEvent, UploadParams, UploadSource, Uploader, UploaderConfig,
+};
+use futures::StreamExt;
+use indicatif::{HumanBytes, HumanDuration, MultiProgress, ProgressBar, ProgressStyle};
+use std::iter;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::iter;
+use std::time::Duration;
 use walkdir::WalkDir;
 
-pub async fn run(
-    local: &PathBuf,
-    remote: &str,
-    recursive: bool,
-    overwrite: bool,
-    _concurrency: usize,
-) -> Result<()> {
+pub async fn run(local: &PathBuf, remote: &str, recursive: bool, overwrite: bool) -> Result<()> {
     let config = config::load()?;
     let server_config = config.default.resolve();
 
     println!("Connecting to {}...", server_config.server);
 
-    let client_config = ClientConfig::new(&server_config.server);
-    let client = Arc::new(Client::new(client_config));
-
-    let login_response = client
-        .login(&server_config.email, &server_config.password)
-        .await
-        .context("Login failed")?;
-
-    client.set_tokens(
-        login_response.token.access_token.clone(),
-        login_response.token.refresh_token.clone(),
-    ).await;
+    let (client, login_response) = client::connect(
+        &server_config.server,
+        &server_config.email,
+        &server_config.password,
+    )
+    .await
+    .context("Login failed")?;
 
     println!("Logged in as: {}", login_response.user.nickname);
 
-    let uploader_config = UploaderConfig::default();
-    let uploader = Uploader::new(Arc::clone(&client), uploader_config);
+    let uploader = Uploader::new(Arc::new(client), UploaderConfig::default());
 
     let normalized_remote = normalize_remote_path(remote);
 
@@ -46,7 +37,7 @@ pub async fn run(
     let multi_progress = Arc::new(MultiProgress::new());
 
     let style = ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}"
+        "[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}"
     )?
     .progress_chars("#>-");
 
@@ -58,18 +49,20 @@ pub async fn run(
 
         let pb = multi_progress.add(ProgressBar::new(0));
         pb.set_style(style.clone());
-        pb.set_message(local_path.file_name().unwrap().to_string_lossy().to_string());
 
-        let progress = ProgressBarCallback { pb: pb.clone() };
+        let label = local_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
 
-        match upload_file(&uploader, &local_path, &remote_uri, overwrite, progress).await {
+        match upload_file(&uploader, &local_path, &remote_uri, overwrite, &label, &pb).await {
             Ok(()) => {
                 success_count += 1;
-                println!("✓ Uploaded: {}", local_path.display());
+                println!("Uploaded: {}", local_path.display());
             }
             Err(e) => {
                 fail_count += 1;
-                eprintln!("✗ Failed: {} - {}", local_path.display(), e);
+                eprintln!("Failed: {} - {}", local_path.display(), e);
             }
         }
     }
@@ -133,26 +126,64 @@ async fn upload_file(
     local_path: &PathBuf,
     remote_uri: &str,
     overwrite: bool,
-    progress: impl ProgressCallback + 'static,
+    label: &str,
+    pb: &ProgressBar,
 ) -> Result<()> {
-    let metadata = tokio::fs::metadata(local_path).await?;
-    let file_size = metadata.len();
-    let last_modified = metadata.modified().ok().and_then(|t| {
-        use std::time::UNIX_EPOCH;
-        t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
-    });
+    let last_modified = tokio::fs::metadata(local_path)
+        .await?
+        .modified()
+        .ok()
+        .and_then(|t| {
+            use std::time::UNIX_EPOCH;
+            t.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
+        });
 
     let params = UploadParams {
-        local_path: local_path.clone(),
+        source: UploadSource::from_path(local_path)?,
         remote_uri: remote_uri.to_string(),
-        file_size,
         mime_type: guess_mime_type(local_path),
         last_modified,
         overwrite,
         previous_version: String::new(),
+        policy_id: String::new(),
+        metadata: None,
     };
 
-    uploader.upload(params, progress).await
+    let stream = uploader.upload(params).await?;
+
+    // Progress is a fold over the events: nothing is uploaded until they are polled.
+    let mut tracker = Tracker::new(&stream.session, &[]);
+    pb.set_length(tracker.current().total_size);
+    pb.set_message(label.to_string());
+
+    let mut events = stream.events;
+    while let Some(event) = events.next().await {
+        match event {
+            UploadEvent::Completed => {
+                pb.set_position(tracker.current().uploaded);
+                return Ok(());
+            }
+            UploadEvent::Failed(error) => return Err(error.into()),
+            event @ UploadEvent::ChunkDone(_) => {
+                if let Some(update) = tracker.observe(&event) {
+                    pb.set_position(update.uploaded);
+                    pb.set_message(format!(
+                        "{} | {}/s | ETA {} | chunks {}/{}",
+                        label,
+                        HumanBytes(update.speed_bytes_per_sec),
+                        match update.eta_seconds {
+                            Some(seconds) => HumanDuration(Duration::from_secs(seconds)).to_string(),
+                            None => "--".to_string(),
+                        },
+                        update.completed_chunks,
+                        update.total_chunks,
+                    ));
+                }
+            }
+        }
+    }
+
+    bail!("upload stream ended without a terminal event")
 }
 
 fn guess_mime_type(path: &PathBuf) -> Option<String> {
@@ -168,18 +199,5 @@ fn guess_mime_type(path: &PathBuf) -> Option<String> {
         "mp4" => Some("video/mp4".to_string()),
         "mp3" => Some("audio/mpeg".to_string()),
         _ => None,
-    }
-}
-
-struct ProgressBarCallback {
-    pb: ProgressBar,
-}
-
-impl ProgressCallback for ProgressBarCallback {
-    fn on_progress(&self, update: ProgressUpdate) {
-        if self.pb.length().unwrap_or(0) == 0 {
-            self.pb.set_length(update.total_size);
-        }
-        self.pb.set_position(update.uploaded);
     }
 }

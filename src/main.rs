@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+mod client;
 mod commands;
 mod config;
 
@@ -29,8 +30,6 @@ enum Commands {
         recursive: bool,
         #[arg(long)]
         overwrite: bool,
-        #[arg(short = 'j', long, default_value = "3")]
-        concurrency: usize,
     },
 }
 
@@ -51,9 +50,8 @@ async fn main() -> anyhow::Result<()> {
             remote,
             recursive,
             overwrite,
-            concurrency,
         } => {
-            commands::upload::run(&local, &remote, recursive, overwrite, concurrency).await?;
+            commands::upload::run(&local, &remote, recursive, overwrite).await?;
         }
     }
 
