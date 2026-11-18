@@ -1,6 +1,7 @@
 use crate::client;
 use crate::config;
 use anyhow::{bail, Context, Result};
+use cloudreve_sdk_api::error::{ApiError, ErrorCode};
 use cloudreve_sdk_uploader::{
     Tracker, UploadEvent, UploadParams, UploadSource, Uploader, UploaderConfig,
 };
@@ -42,6 +43,7 @@ pub async fn run(local: &PathBuf, remote: &str, recursive: bool, overwrite: bool
     .progress_chars("#>-");
 
     let mut success_count = 0;
+    let mut skipped_count = 0;
     let mut fail_count = 0;
 
     for item_result in upload_items {
@@ -56,9 +58,16 @@ pub async fn run(local: &PathBuf, remote: &str, recursive: bool, overwrite: bool
             .unwrap_or_default();
 
         match upload_file(&uploader, &local_path, &remote_uri, overwrite, &label, &pb).await {
-            Ok(()) => {
+            Ok(UploadOutcome::Uploaded) => {
                 success_count += 1;
                 println!("Uploaded: {}", local_path.display());
+            }
+            Ok(UploadOutcome::Skipped) => {
+                skipped_count += 1;
+                println!(
+                    "Skipped: {} (remote file exists, use --overwrite to replace)",
+                    local_path.display()
+                );
             }
             Err(e) => {
                 fail_count += 1;
@@ -67,7 +76,14 @@ pub async fn run(local: &PathBuf, remote: &str, recursive: bool, overwrite: bool
         }
     }
 
-    println!("\nUpload complete: {} succeeded, {} failed", success_count, fail_count);
+    println!(
+        "\nUpload complete: {} succeeded, {} skipped, {} failed",
+        success_count, skipped_count, fail_count
+    );
+
+    if fail_count > 0 {
+        bail!("{} file(s) failed to upload", fail_count);
+    }
 
     Ok(())
 }
@@ -121,6 +137,11 @@ fn create_upload_stream<'a>(
     }
 }
 
+enum UploadOutcome {
+    Uploaded,
+    Skipped,
+}
+
 async fn upload_file(
     uploader: &Uploader,
     local_path: &PathBuf,
@@ -128,7 +149,7 @@ async fn upload_file(
     overwrite: bool,
     label: &str,
     pb: &ProgressBar,
-) -> Result<()> {
+) -> Result<UploadOutcome> {
     let last_modified = tokio::fs::metadata(local_path)
         .await?
         .modified()
@@ -149,7 +170,11 @@ async fn upload_file(
         metadata: None,
     };
 
-    let stream = uploader.upload(params).await?;
+    let stream = match uploader.upload(params).await {
+        Ok(stream) => stream,
+        Err(error) if is_object_existed(&error) => return Ok(UploadOutcome::Skipped),
+        Err(error) => return Err(error),
+    };
 
     // Progress is a fold over the events: nothing is uploaded until they are polled.
     let mut tracker = Tracker::new(&stream.session, &[]);
@@ -161,7 +186,7 @@ async fn upload_file(
         match event {
             UploadEvent::Completed => {
                 pb.set_position(tracker.current().uploaded);
-                return Ok(());
+                return Ok(UploadOutcome::Uploaded);
             }
             UploadEvent::Failed(error) => return Err(error.into()),
             event @ UploadEvent::ChunkDone(_) => {
@@ -186,6 +211,17 @@ async fn upload_file(
     bail!("upload stream ended without a terminal event")
 }
 
+/// The upload session is rejected when the remote file already exists and the
+/// caller did not ask for a new version.
+fn is_object_existed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<ApiError>(),
+            Some(ApiError::ApiError { code, .. }) if *code == ErrorCode::ObjectExisted as i32
+        )
+    })
+}
+
 fn guess_mime_type(path: &PathBuf) -> Option<String> {
     let ext = path.extension()?.to_string_lossy().to_lowercase();
     match ext.as_str() {
@@ -199,5 +235,33 @@ fn guess_mime_type(path: &PathBuf) -> Option<String> {
         "mp4" => Some("video/mp4".to_string()),
         "mp3" => Some("audio/mpeg".to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn api_error(code: i32) -> anyhow::Error {
+        anyhow::Error::new(ApiError::ApiError {
+            code,
+            message: "remote file exists".to_string(),
+            error_detail: None,
+            correlation_id: None,
+            aggregated_errors: None,
+        })
+        .context("failed to create upload session")
+    }
+
+    #[test]
+    fn object_existed_is_detected_through_context() {
+        assert!(is_object_existed(&api_error(ErrorCode::ObjectExisted as i32)));
+    }
+
+    #[test]
+    fn other_api_errors_are_reported_as_failures() {
+        assert!(!is_object_existed(&api_error(
+            ErrorCode::ParentNotExist as i32
+        )));
     }
 }

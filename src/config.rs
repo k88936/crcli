@@ -34,13 +34,6 @@ impl ServerConfig {
                 .expect("CLOUDREVE_PASSWORD not set and no password in config"),
         }
     }
-
-    pub fn is_configured(&self) -> bool {
-        let has_server = env::var("CLOUDREVE_SERVER").is_ok() || self.server.is_some();
-        let has_email = env::var("CLOUDREVE_EMAIL").is_ok() || self.email.is_some();
-        let has_password = env::var("CLOUDREVE_PASSWORD").is_ok() || self.password.is_some();
-        has_server && has_email && has_password
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +46,7 @@ pub struct ResolvedConfig {
 fn config_path() -> PathBuf {
     dirs::home_dir()
         .expect("Could not find home directory")
-        .join("cloudreve-cli.toml")
+        .join("crcli.toml")
 }
 
 pub fn load() -> Result<Config> {

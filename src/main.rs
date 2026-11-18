@@ -28,6 +28,7 @@ enum Commands {
         remote: String,
         #[arg(short, long)]
         recursive: bool,
+        /// Upload a new version when the remote file already exists
         #[arg(long)]
         overwrite: bool,
     },

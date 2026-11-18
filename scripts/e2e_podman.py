@@ -117,13 +117,33 @@ def list_folder(server: str, uri: str) -> dict[str, int]:
     return {file["name"]: file["size"] for file in listing["files"]}
 
 
-def crcli(environment: dict[str, str], *arguments: str) -> None:
-    subprocess.run(
+def verify_remote_sizes(server: str, uri: str, expected: dict[str, int]) -> None:
+    """Check the remote folder holds exactly these names with these sizes."""
+    files = list_folder(server, uri)
+    for name, size in expected.items():
+        actual = files.get(name)
+        if actual != size:
+            raise RuntimeError(
+                f"{uri}{name} has size {actual}, expected {size}: {files!r}"
+            )
+
+
+def crcli(environment: dict[str, str], *arguments: str) -> str:
+    """Run crcli, echo its output and return it."""
+    result = subprocess.run(
         (str(BINARY), *arguments),
         cwd=REPOSITORY,
         env=environment,
-        check=True,
+        capture_output=True,
+        text=True,
     )
+    sys.stdout.write(result.stdout)
+    sys.stderr.write(result.stderr)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"crcli {' '.join(arguments)} exited with {result.returncode}"
+        )
+    return result.stdout + result.stderr
 
 
 def main() -> None:
@@ -179,7 +199,7 @@ def main() -> None:
     print("Building crcli", flush=True)
     run("cargo", "build", "--quiet")
 
-    # Run the CLI with a throwaway HOME so ~/cloudreve-cli.toml is never touched.
+    # Run the CLI with a throwaway HOME so ~/crcli.toml is never touched.
     with tempfile.TemporaryDirectory(prefix="crcli-e2e-home-") as home:
         environment = os.environ.copy()
         environment["HOME"] = home
@@ -196,7 +216,7 @@ def main() -> None:
             PASSWORD,
         )
 
-        config_path = Path(home) / "cloudreve-cli.toml"
+        config_path = Path(home) / "crcli.toml"
         if not config_path.is_file():
             raise RuntimeError(f"login did not write {config_path}")
         print(f"Verified that login wrote {config_path}", flush=True)
@@ -251,6 +271,73 @@ def main() -> None:
             )
 
         print(f"Verified {single_name} ({single_size} bytes) and {nested_name}", flush=True)
+
+        # Upload conflicts: same names are skipped unless --overwrite is given.
+        conflict_root = f"{REMOTE_ROOT}crcli-e2e-conflict-{os.getpid()}"
+        conflict_dir = payload_root / "conflict"
+        conflict_dir.mkdir()
+
+        def write_payload(name: str, size: int) -> int:
+            """Write a file whose byte length identifies this local revision."""
+            content = bytes((index * 31 + size) % 256 for index in range(size))
+            (conflict_dir / name).write_bytes(content)
+            return len(content)
+
+        a_v1 = write_payload("a.bin", 8192)
+        print("Conflict round 1: uploading only a", flush=True)
+        crcli(
+            environment,
+            "upload",
+            str(conflict_dir),
+            conflict_root,
+            "--recursive",
+        )
+        verify_remote_sizes(server, f"{conflict_root}/", {"a.bin": a_v1})
+
+        write_payload("a.bin", 24576)
+        b_v1 = write_payload("b.bin", 16384)
+        print("Conflict round 2: uploading a (changed) and b", flush=True)
+        output = crcli(
+            environment,
+            "upload",
+            str(conflict_dir),
+            conflict_root,
+            "--recursive",
+        )
+        if "Skipped:" not in output or "a.bin" not in output:
+            raise RuntimeError(f"a.bin was not reported as skipped: {output!r}")
+        if "1 succeeded, 1 skipped" not in output:
+            raise RuntimeError(f"unexpected summary: {output!r}")
+        verify_remote_sizes(
+            server, f"{conflict_root}/", {"a.bin": a_v1, "b.bin": b_v1}
+        )
+
+        a_v3 = write_payload("a.bin", 4096)
+        b_v2 = write_payload("b.bin", 32768)
+        c_v1 = write_payload("c.bin", 2048)
+        print("Conflict round 3: uploading a, b and c with --overwrite", flush=True)
+        output = crcli(
+            environment,
+            "upload",
+            str(conflict_dir),
+            conflict_root,
+            "--recursive",
+            "--overwrite",
+        )
+        if "Skipped:" in output:
+            raise RuntimeError(f"--overwrite still skipped a file: {output!r}")
+        if "3 succeeded, 0 skipped" not in output:
+            raise RuntimeError(f"unexpected summary: {output!r}")
+        verify_remote_sizes(
+            server,
+            f"{conflict_root}/",
+            {"a.bin": a_v3, "b.bin": b_v2, "c.bin": c_v1},
+        )
+        print(
+            "Verified conflict handling: a.bin kept "
+            f"{a_v1} bytes until --overwrite set {a_v3}/{b_v2}/{c_v1}",
+            flush=True,
+        )
 
     print("E2E test passed", flush=True)
 

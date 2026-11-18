@@ -12,7 +12,7 @@ pub async fn run(server: &str, email: &str, password: &str) -> Result<()> {
 
     config::save_credentials(server, email, password)?;
 
-    println!("Credentials saved to ~/cloudreve-cli.toml");
+    println!("Credentials saved to ~/crcli.toml");
 
     Ok(())
 }
